@@ -185,6 +185,18 @@ def build_model(model_name, num_classes, device):
     raise ValueError(f"Unsupported model: {model_name}")
 
 
+def clone_model_state(model):
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def is_improved(metric_name, best_value, current_value, min_delta):
+    if best_value is None:
+        return True
+    if metric_name == "loss":
+        return current_value < (best_value - min_delta)
+    return current_value > (best_value + min_delta)
+
+
 def evaluate(epoch, split_name, dataloader, device, model, loss_fn, tensorboard_writer, evaluator=None):
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
@@ -219,10 +231,40 @@ def evaluate(epoch, split_name, dataloader, device, model, loss_fn, tensorboard_
         metrics = evaluator.evaluate(torch.cat(y_scores).numpy())
         print(f" {split_name.upper()} AUC: {metrics.AUC:>0.4f}")
         tensorboard_writer.add_scalar(f"AUC/{split_name}", metrics.AUC, epoch)
+    else:
+        metrics = None
+
+    return {
+        "loss": average_loss,
+        "accuracy": accuracy,
+        "auc": None if metrics is None else metrics.AUC,
+    }
 
 
-def train(epochs, train_dataloader, eval_dataloader, eval_name, device, model, loss_fn, optimizer, scheduler, tensorboard_writer, evaluator=None):
+def train(
+    epochs,
+    train_dataloader,
+    eval_dataloader,
+    eval_name,
+    device,
+    model,
+    loss_fn,
+    optimizer,
+    scheduler,
+    tensorboard_writer,
+    evaluator=None,
+    early_stopping_enabled=True,
+    early_stopping_metric="loss",
+    early_stopping_patience=20,
+    early_stopping_min_delta=1e-4,
+):
     global_step = -1
+    best_metric_value = None
+    best_epoch = None if early_stopping_enabled else epochs
+    best_model_state = clone_model_state(model) if early_stopping_enabled else None
+    patience_counter = 0
+    stopped_early = False
+    stop_epoch = epochs
 
     for epoch in range(1, epochs + 1):
         print(f"Epoch {epoch}\n-------------------------------")
@@ -244,7 +286,7 @@ def train(epochs, train_dataloader, eval_dataloader, eval_name, device, model, l
                 tensorboard_writer.add_scalar("Loss/train", loss.item(), global_step)
 
         scheduler.step()
-        evaluate(
+        eval_metrics = evaluate(
             epoch=epoch,
             split_name=eval_name,
             dataloader=eval_dataloader,
@@ -254,6 +296,40 @@ def train(epochs, train_dataloader, eval_dataloader, eval_name, device, model, l
             tensorboard_writer=tensorboard_writer,
             evaluator=evaluator,
         )
+
+        if early_stopping_enabled:
+            monitored_value = eval_metrics[early_stopping_metric]
+            if monitored_value is None:
+                raise ValueError(f"Early stopping metric '{early_stopping_metric}' is not available for {eval_name}.")
+
+            if is_improved(early_stopping_metric, best_metric_value, monitored_value, early_stopping_min_delta):
+                best_metric_value = monitored_value
+                best_epoch = epoch
+                best_model_state = clone_model_state(model)
+                patience_counter = 0
+                print(f" New best {eval_name}_{early_stopping_metric}: {best_metric_value:.6f} at epoch {epoch}")
+            else:
+                patience_counter += 1
+                remaining_patience = early_stopping_patience - patience_counter
+                print(
+                    f" No {eval_name}_{early_stopping_metric} improvement. "
+                    f"Patience {patience_counter}/{early_stopping_patience}"
+                )
+                if remaining_patience <= 0:
+                    stopped_early = True
+                    stop_epoch = epoch
+                    print(f"Early stopping triggered at epoch {epoch}. Restoring epoch {best_epoch}.")
+                    break
+
+    if early_stopping_enabled:
+        model.load_state_dict(best_model_state)
+    return {
+        "best_epoch": best_epoch,
+        "best_metric_name": early_stopping_metric,
+        "best_metric_value": best_metric_value,
+        "stopped_early": stopped_early,
+        "stop_epoch": stop_epoch,
+    }
 
 
 def main():
@@ -266,6 +342,9 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="pathmnist")
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--early_stopping_metric", type=str, default="loss", choices=["loss", "accuracy", "auc"])
+    parser.add_argument("--early_stopping_patience", type=int, default=20)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     parser.add_argument("--save_path", type=str, default="checkpoint")
     args = parser.parse_args()
 
@@ -309,24 +388,53 @@ def main():
     eval_name = "val" if dataloaders["val"] is not None else "test"
     eval_dataloader = dataloaders[eval_name]
 
-    train(
-        epochs=args.epochs,
-        train_dataloader=dataloaders["train"],
-        eval_dataloader=eval_dataloader,
-        eval_name=eval_name,
-        device=device,
-        model=model,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        tensorboard_writer=tensorboard_writer,
-        evaluator=metadata["evaluator"].get(eval_name),
-    )
+    if eval_name == "test":
+        print("Validation split is unavailable. Early stopping is disabled and test is used only for final evaluation.")
+        train_summary = train(
+            epochs=args.epochs,
+            train_dataloader=dataloaders["train"],
+            eval_dataloader=eval_dataloader,
+            eval_name=eval_name,
+            device=device,
+            model=model,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            tensorboard_writer=tensorboard_writer,
+            evaluator=metadata["evaluator"].get(eval_name),
+            early_stopping_enabled=False,
+            early_stopping_metric="loss",
+            early_stopping_patience=args.epochs + 1,
+            early_stopping_min_delta=0.0,
+        )
+    else:
+        train_summary = train(
+            epochs=args.epochs,
+            train_dataloader=dataloaders["train"],
+            eval_dataloader=eval_dataloader,
+            eval_name=eval_name,
+            device=device,
+            model=model,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            tensorboard_writer=tensorboard_writer,
+            evaluator=metadata["evaluator"].get(eval_name),
+            early_stopping_metric=args.early_stopping_metric,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+        )
+
+    if train_summary["best_metric_value"] is not None:
+        print(
+            f"Best {eval_name}_{train_summary['best_metric_name']}: "
+            f"{train_summary['best_metric_value']:.6f} at epoch {train_summary['best_epoch']}"
+        )
 
     if eval_name != "test":
         print("Final test evaluation\n-------------------------------")
         evaluate(
-            epoch=args.epochs,
+            epoch=train_summary["best_epoch"],
             split_name="test",
             dataloader=dataloaders["test"],
             device=device,
@@ -340,7 +448,11 @@ def main():
 
     if args.save_path:
         os.makedirs(args.save_path, exist_ok=True)
-        filename = f"{args.model}-{args.dataset_name}-{args.epochs}-{datetime.now().strftime('%m%d_%H%M')}.pth"
+        trained_epochs = train_summary["stop_epoch"] if train_summary["stopped_early"] else args.epochs
+        filename = (
+            f"{args.model}-{args.dataset_name}-best-epoch{train_summary['best_epoch']}"
+            f"-trained{trained_epochs}-{datetime.now().strftime('%m%d_%H%M')}.pth"
+        )
         save_file = os.path.join(args.save_path, filename)
         torch.save(model.state_dict(), save_file)
         print(f"Saved PyTorch Model State to {save_file}")
