@@ -1,15 +1,7 @@
-# ELLab ML Study
+# ML Study
 - dataset: PathMNIST / CIFAR10
 - task: image classification
 - pytorch
-- from scratch
-    - pytorch 공식 문서 / tutorial
-    - AI x
-- 코드 모듈화
-    - 재사용이 가능하고
-    - 새로운 모듈 추가가 쉽고
-    - 다양한 세팅을 코드 수정 없이 실행 가능하도록
-    - 학습 loss, epoch별 test accuracy -> tensorboard로 기록하도록
 
 # Quick Start
 ```bash
